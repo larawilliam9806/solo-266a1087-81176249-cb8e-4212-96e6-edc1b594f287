@@ -103,6 +103,39 @@ curl "http://localhost:8000/ships/SH01/stops?version_id=1"  # 指定历史版本
 | `GET /batches/{batch_no}` | 批次信息与现行消息数 |
 | `GET /versions` | 全部结果版本（含历史版本与 active 标记） |
 
+### 各批贡献汇总
+
+按**消息时刻的 UTC 自然日**统计每批给船位底表贡献了多少观测。重复报送的
+同一条消息（同号同内容）在总数里只算一条，但会在仍提供它的批次之间分配。
+
+```bash
+curl "http://localhost:8000/contributions"                       # 全部 UTC 日
+curl "http://localhost:8000/contributions?date=2026-11-24"       # 指定日期
+curl "http://localhost:8000/contributions/2026-11-24"            # 同上（路径形式）
+curl "http://localhost:8000/batches/B1/contributions"            # 某批按日展开
+```
+
+每天返回：
+
+| 字段 | 说明 |
+| --- | --- |
+| `dedup_total` | 当天去重后的有效消息总数（同号同内容只算一条） |
+| `batches[].valid_message_count` | 有效消息数：该批仍提供的消息条数 |
+| `batches[].exclusive_message_count` | 独家消息数：仅由该批提供的消息条数 |
+| `batches[].apportioned_count` | 折算数：每条消息在仍提供它的批次间平分 1 条，`"分子/分母"` 精确分数 |
+
+例如同一条消息由 B1、B2 共同提供，则 B1、B2 各记 `1/2`；各批折算数之和
+**恒等于当天 `dedup_total`**（用精确分数累计，无浮点误差）。
+
+口径与一致性：
+
+- 可带 `version_id` 查询历史版本的汇总，缺省为现行版本；
+- 汇总与停靠结果、批次在同一个写事务内生成，写入失败整体回滚；查询只读该
+  已生效版本的汇总行，各批统计与去重总数来自同一份已生效数据；
+- 补交/换交只重建**来源集合确有增减**的消息所在的 UTC 日。即使当天去重总数
+  没变，受影响的批次也会按新份额重算（例如某条共享消息少了/多了一个来源）；
+- 旧库首次启用（表刚建、现行版本尚无汇总）时，按现行消息与来源自动补建。
+
 ## 4. 测试
 
 ```bash
@@ -111,18 +144,20 @@ python -m pytest -q
 ```
 
 覆盖：矩形边界、30 分钟断段、停靠/待补分类、同号异值与同船同刻异号整批退回、
-多批来源叠加、换交失效与他批保留、段级/港内段级增量沿用、历史版本查询、写入失败回滚。
+多批来源叠加、换交失效与他批保留、段级/港内段级增量沿用、历史版本查询、写入失败回滚；
+贡献汇总的有效/独家/折算分数、同日来源增减后的重新分摊、UTC 日切分、历史版本与旧库补建。
 
 ## 5. 目录结构
 
 ```
 app/
-  config.py    # 港区矩形与 DB 路径配置
-  database.py  # SQLite 连接、WAL、表结构、事务上下文
-  engine.py    # 纯逻辑：UTC 解析、断段、港内连续点与沿用判定
-  models.py    # Pydantic 请求/响应模型
-  service.py   # 批次校验、换交、增量核算事务、查询装配
-  main.py      # FastAPI 路由
-tests/         # pytest 引擎单测与 API 端到端测试
+  config.py       # 港区矩形与 DB 路径配置
+  database.py     # SQLite 连接、WAL、表结构、事务上下文
+  engine.py       # 纯逻辑：UTC 解析、断段、港内连续点与沿用判定
+  contribution.py # 贡献汇总：精确分数分摊、按版本存储、旧库补建
+  models.py       # Pydantic 请求/响应模型
+  service.py      # 批次校验、换交、增量核算事务、查询装配
+  main.py         # FastAPI 路由
+tests/            # pytest 引擎单测、API 端到端与贡献汇总测试
 docker-compose.yml / Dockerfile / requirements.txt
 ```

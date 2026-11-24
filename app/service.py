@@ -5,9 +5,11 @@ import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
+from fractions import Fraction
 from typing import Any, Optional
 
 from .config import PortRect
+from . import contribution
 from .engine import (
     InPortRun,
     Point,
@@ -143,6 +145,10 @@ def apply_batch(
     """
     by_msg = _validate_incoming(conn, batch_no, messages, mode)
 
+    # 旧库首次启用贡献汇总时，先按现行消息与来源补建当前生效版本，
+    # 之后的新版本才能从它增量复制。
+    contribution.backfill_if_needed(conn)
+
     # 换交：找出本批不再提供的消息及其旧内容（作为虚拟删除标记点）
     removed_rows: list[sqlite3.Row] = []
     if mode == "replace":
@@ -172,10 +178,13 @@ def apply_batch(
     # 2) 消息与来源。
     #    改动点 = 新纳入的消息（首次出现）或换交中被删除的消息；
     #    已由其他批次提供、本批只是重复提供的同内容消息不算改动点。
+    #    contributed_days 收集来源集合确有增减的消息所在 UTC 日，
+    #    只有这些日的贡献汇总需要按新份额重建。
     newly_inserted: set[str] = set()
+    contributed_days: set[str] = set()
     for msg_no, c in by_msg.items():
         row = conn.execute(
-            "SELECT active FROM message WHERE msg_no=?", (msg_no,)
+            "SELECT active, ts FROM message WHERE msg_no=?", (msg_no,)
         ).fetchone()
         if row is None:
             conn.execute(
@@ -192,23 +201,31 @@ def apply_batch(
                 ),
             )
             newly_inserted.add(msg_no)
+            contributed_days.add(c["ts"][:10])
         elif row["active"] == 0:
             # 历史上被软删、同号同内容重新纳入 -> 重新生效，属于改动点
             conn.execute(
                 "UPDATE message SET active=1 WHERE msg_no=?", (msg_no,)
             )
             newly_inserted.add(msg_no)
-        conn.execute(
+            contributed_days.add(row["ts"][:10])
+        source_cur = conn.execute(
             "INSERT OR IGNORE INTO message_source(msg_no, batch_no) VALUES(?,?)",
             (msg_no, batch_no),
         )
+        if source_cur.rowcount:
+            # 本批成为该消息的新来源：即使去重总数不变，
+            # 仍与其他提供它的批次重新平分，这些批次的份额都要更新。
+            contributed_days.add(row["ts"][:10] if row is not None else c["ts"][:10])
 
     deleted_msg_nos: set[str] = set()
     for r in removed_rows:
-        conn.execute(
+        cur = conn.execute(
             "DELETE FROM message_source WHERE msg_no=? AND batch_no=?",
             (r["msg_no"], batch_no),
         )
+        if cur.rowcount:
+            contributed_days.add(r["ts"][:10])
         left = conn.execute(
             "SELECT 1 FROM message_source WHERE msg_no=?", (r["msg_no"],)
         ).fetchone()
@@ -235,6 +252,23 @@ def apply_batch(
         (_now(), _batch_set_hash(active_batches), json.dumps(active_batches)),
     )
     new_vid = cur.lastrowid
+
+    # 贡献汇总：先整体沿用上一生效版本，再只重建来源确有增减的 UTC 日。
+    # 与停靠结果同一事务；旧库无汇总时由 backfill_if_needed 补建。
+    if old_vid is not None:
+        contribution.copy_version(conn, old_vid, new_vid)
+        if contributed_days:
+            contribution.recompute_days(conn, new_vid, contributed_days)
+    else:
+        # 首个版本：按现有消息的日期全量重建
+        contribution.recompute_days(
+            conn,
+            new_vid,
+            {
+                r["ts"][:10]
+                for r in conn.execute("SELECT ts FROM message WHERE active=1")
+            },
+        )
 
     reused = 0
     recomputed = 0
@@ -568,3 +602,67 @@ def get_batch_info(conn: sqlite3.Connection, batch_no: str) -> Optional[dict]:
         "active": True,
         "message_count": count,
     }
+
+
+def batch_exists(conn: sqlite3.Connection, batch_no: str) -> bool:
+    return (
+        conn.execute("SELECT 1 FROM batch WHERE batch_no=?", (batch_no,)).fetchone()
+        is not None
+    )
+
+
+# ---------------------------------------------------------------- 贡献汇总查询
+
+def query_contributions(
+    conn: sqlite3.Connection,
+    version_id: Optional[int],
+    day: Optional[str] = None,
+) -> list[dict]:
+    """只读已生效版本存储的汇总，不重新扫描消息表，保证同日各批与总数同源。"""
+    version = resolve_version(conn, version_id)
+    if version is None:
+        return []
+    vid = version["version_id"]
+    if day is not None:
+        row = contribution.query_day(conn, vid, day)
+        return [row] if row is not None else []
+    return contribution.query_days(conn, vid)
+
+
+def query_batch_contributions(
+    conn: sqlite3.Connection,
+    batch_no: str,
+    version_id: Optional[int],
+) -> list[dict]:
+    version = resolve_version(conn, version_id)
+    if version is None:
+        return []
+    vid = version["version_id"]
+    rows = conn.execute(
+        "SELECT day, valid_count, exclusive_count, share_num, share_den "
+        "FROM contribution_batch WHERE version_id=? AND batch_no=? ORDER BY day",
+        (vid, batch_no),
+    ).fetchall()
+    result = []
+    for row in rows:
+        value = Fraction(row["share_num"], row["share_den"])
+        text = contribution.fraction_text(value)
+        result.append(
+            {
+                "batch_no": batch_no,
+                "version_id": vid,
+                "date": row["day"],
+                "valid_message_count": row["valid_count"],
+                "valid_count": row["valid_count"],
+                "message_count": row["valid_count"],
+                "exclusive_message_count": row["exclusive_count"],
+                "exclusive_count": row["exclusive_count"],
+                "apportioned_count": text,
+                "apportioned": text,
+                "share": text,
+                "fraction": text,
+                "apportioned_numerator": value.numerator,
+                "apportioned_denominator": value.denominator,
+            }
+        )
+    return result

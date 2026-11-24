@@ -85,11 +85,37 @@ CREATE TABLE IF NOT EXISTS pending_record (
     FOREIGN KEY (version_id) REFERENCES result_version(version_id)
 );
 
+-- 按 UTC 日、按版本的观测贡献汇总（与停靠结果同事务生效）
+-- dedup_total：当天去重后的有效消息条数
+CREATE TABLE IF NOT EXISTS contribution_day (
+    version_id  INTEGER NOT NULL,
+    day         TEXT NOT NULL,           -- UTC 自然日 YYYY-MM-DD
+    dedup_total INTEGER NOT NULL,
+    PRIMARY KEY (version_id, day),
+    FOREIGN KEY (version_id) REFERENCES result_version(version_id)
+);
+
+-- 某批在某日的贡献：有效消息数、独家消息数、折算数（精确分数）
+CREATE TABLE IF NOT EXISTS contribution_batch (
+    version_id       INTEGER NOT NULL,
+    day              TEXT NOT NULL,
+    batch_no         TEXT NOT NULL,
+    valid_count      INTEGER NOT NULL,
+    exclusive_count  INTEGER NOT NULL,
+    share_num        INTEGER NOT NULL,   -- 折算数分子
+    share_den        INTEGER NOT NULL,   -- 折算数分母（>0）
+    PRIMARY KEY (version_id, day, batch_no),
+    FOREIGN KEY (version_id) REFERENCES result_version(version_id),
+    FOREIGN KEY (batch_no)   REFERENCES batch(batch_no)
+);
+
 CREATE INDEX IF NOT EXISTS idx_msg_ship_ts ON message(ship_no, ts, active);
 CREATE INDEX IF NOT EXISTS idx_src_batch   ON message_source(batch_no);
 CREATE INDEX IF NOT EXISTS idx_stop_ver    ON stop_record(version_id, ship_no);
 CREATE INDEX IF NOT EXISTS idx_pend_ver    ON pending_record(version_id, ship_no);
 CREATE INDEX IF NOT EXISTS idx_ver_active  ON result_version(active);
+CREATE INDEX IF NOT EXISTS idx_contrib_day ON contribution_day(version_id, day);
+CREATE INDEX IF NOT EXISTS idx_contrib_bat ON contribution_batch(version_id, day, batch_no);
 """
 
 
@@ -111,6 +137,11 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # 旧库首次启用：按现行消息与来源补建现行版本的贡献汇总
+    from . import contribution
+
+    with transaction(conn):
+        contribution.backfill_if_needed(conn)
 
 
 @contextmanager

@@ -88,3 +88,52 @@ class VersionInfo(BaseModel):
     created_at: str
     batches: list[str]
     active: bool
+
+
+class BatchContributionOut(BaseModel):
+    batch_no: str
+    # 有效消息数（该批仍提供的消息条数）
+    valid_message_count: int = Field(description="有效消息数")
+    valid_count: int
+    message_count: int
+    # 独家消息数（仅该批提供的条数）
+    exclusive_message_count: int = Field(description="独家消息数")
+    exclusive_count: int
+    # 折算数：精确分数，各批之和等于当天去重总数
+    apportioned_count: str = Field(description="折算数，精确分数文本，如 3/2")
+    apportioned: str
+    share: str
+    fraction: str
+    apportioned_numerator: int = Field(description="折算数分子（约分后）")
+    apportioned_denominator: int = Field(description="折算数分母（约分后）")
+
+
+class DayContributionOut(BaseModel):
+    version_id: int
+    date: str = Field(description="UTC 自然日 YYYY-MM-DD")
+    day: str
+    utc_date: str
+    # 当天去重后的有效消息总数
+    dedup_total: int = Field(description="当天去重后的有效消息总数")
+    deduplicated_total: int
+    unique_total: int
+    total: int
+    batches: list[BatchContributionOut]
+    by_batch: dict[str, BatchContributionOut]
+
+
+class BatchContributionDayOut(BaseModel):
+    batch_no: str
+    version_id: int
+    date: str
+    valid_message_count: int
+    exclusive_message_count: int
+    apportioned_count: str
+    apportioned: str
+    share: str
+    fraction: str
+    apportioned_numerator: int
+    apportioned_denominator: int
+    valid_count: int
+    message_count: int
+    exclusive_count: int

@@ -11,9 +11,11 @@ from .config import get_port_rect
 from .database import connect, init_db, transaction
 from .engine import ValidationError
 from .models import (
+    BatchContributionDayOut,
     BatchInfo,
     BatchResult,
     BatchSubmit,
+    DayContributionOut,
     PendingRecordOut,
     StopRecordOut,
     VersionInfo,
@@ -132,3 +134,70 @@ def get_pending(
 @app.get("/versions", response_model=list[VersionInfo])
 def versions(conn=Depends(get_conn)) -> list[VersionInfo]:
     return [VersionInfo(**v) for v in service.list_versions(conn)]
+
+
+def _effective_date(
+    date: Optional[str], utc_date: Optional[str], day: Optional[str]
+) -> Optional[str]:
+    return date or utc_date or day
+
+
+@app.get("/contributions", response_model=list[DayContributionOut])
+def contributions(
+    date: Optional[str] = Query(
+        None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="UTC 日 YYYY-MM-DD"
+    ),
+    utc_date: Optional[str] = Query(
+        None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="date 的别名"
+    ),
+    day: Optional[str] = Query(
+        None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="date 的别名"
+    ),
+    version_id: Optional[int] = Query(None, description="缺省查现行版本，可指定历史版本"),
+    conn=Depends(get_conn),
+) -> list[DayContributionOut]:
+    """按 UTC 日列出各批的贡献：有效消息数、独家消息数、折算数。
+
+    折算数用精确分数表示，各批之和等于当天去重总数；批次与去重总数
+    均来自同一份已生效版本汇总。
+    """
+    if version_id is not None and service.resolve_version(conn, version_id) is None:
+        raise HTTPException(status_code=404, detail="结果版本不存在")
+    chosen = _effective_date(date, utc_date, day)
+    return [
+        DayContributionOut(**row)
+        for row in service.query_contributions(conn, version_id, chosen)
+    ]
+
+
+@app.get("/contributions/{date}", response_model=DayContributionOut)
+def contribution_of_day(
+    date: str,
+    version_id: Optional[int] = Query(None, description="缺省查现行版本，可指定历史版本"),
+    conn=Depends(get_conn),
+) -> DayContributionOut:
+    if version_id is not None and service.resolve_version(conn, version_id) is None:
+        raise HTTPException(status_code=404, detail="结果版本不存在")
+    rows = service.query_contributions(conn, version_id, date)
+    if not rows:
+        raise HTTPException(status_code=404, detail="该 UTC 日没有贡献记录")
+    return DayContributionOut(**rows[0])
+
+
+@app.get(
+    "/batches/{batch_no}/contributions",
+    response_model=list[BatchContributionDayOut],
+)
+def batch_contributions(
+    batch_no: str,
+    version_id: Optional[int] = Query(None, description="缺省查现行版本，可指定历史版本"),
+    conn=Depends(get_conn),
+) -> list[BatchContributionDayOut]:
+    if not service.batch_exists(conn, batch_no):
+        raise HTTPException(status_code=404, detail="批次不存在")
+    if version_id is not None and service.resolve_version(conn, version_id) is None:
+        raise HTTPException(status_code=404, detail="结果版本不存在")
+    return [
+        BatchContributionDayOut(**row)
+        for row in service.query_batch_contributions(conn, batch_no, version_id)
+    ]
